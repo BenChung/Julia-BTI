@@ -1,3 +1,4 @@
+
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
 import Core: _apply, svec, apply_type, Builtin, IntrinsicFunction, MethodInstance
@@ -1588,6 +1589,23 @@ add_tfunc(apply_type, 1, IInf, apply_type_tfunc, 10)
     return typeof(v)
 end
 
+bitf_external_hash = x -> 0
+
+function bitf_randomize(@nospecialize(f), sv::InferenceState)
+    funname = :nothing
+    if isa(sv.linfo.def, Module)
+        funname = module_name(sv.linfo.def)
+    elseif isa(sv.linfo.def, Method)
+        funname = sv.linfo.def.name
+    end
+    if (module_name(sv.mod), funname, sv.currpc) == bitf_trigger
+        global bitf_total += 1
+        return true
+    end
+    global bitf_total += 1
+    return false
+end
+
 function invoke_tfunc(@nospecialize(f), @nospecialize(types), @nospecialize(argtype), sv::InferenceState)
     if !isleaftype(Type{types})
         return Any
@@ -1636,6 +1654,7 @@ end
 function builtin_tfunction(@nospecialize(f), argtypes::Array{Any,1},
                            sv::Union{InferenceState,Void}, params::InferenceParams = sv.params)
     isva = !isempty(argtypes) && isvarargtype(argtypes[end])
+
     if f === tuple
         for a in argtypes
             if !isa(a, Const)
@@ -1886,7 +1905,42 @@ function abstract_call_gf_by_type(@nospecialize(f), @nospecialize(atype), sv::In
     return rettype
 end
 
+bitf_total = 0
+bitf_trigger = Void()
+bitf_print = false
+bitf_log = false
+bitf_pcs = Array{Tuple{Symbol, Symbol, Int}, 1}()
+
+function bitf_trigger_set(on::Tuple{Symbol, Symbol, Int})
+    global bitf_trigger = on
+end
+
+function bitf_print_set(on::Bool)
+    global bitf_print = on
+end
+
+function bitf_log_set(on::Bool)
+    global bitf_log = on
+end
+
+function print_inferred_call(f, argtypes, rt, sv)
+    println(f, "|", argtypes, "|", rt == Any, "|", sv.currpc, ";")
+end
+
+function bitf_randomize(::Any, ::Void)
+    return false
+end
+
 function abstract_call_method(method::Method, @nospecialize(f), @nospecialize(sig), sparams::SimpleVector, sv::InferenceState)
+    if bitf_log || !isa(bitf_trigger, Void)
+        tup = (module_name(sv.mod), method.name, sv.currpc)
+        if bitf_log
+            push!(bitf_pcs, tup)
+        elseif bitf_trigger == tup
+            return Any
+        end
+    end
+
     limited = sv.limited
     # If we are operating without inference limits,
     # see if we need to enable those.
@@ -4387,6 +4441,40 @@ function invoke_NF(argexprs, @nospecialize(etype), atypes::Vector{Any}, sv::Opti
     return NF
 end
 
+
+bitf_module = Void()
+bitf_functions = []
+bitf_external_hash = Void()
+bitf_showerror = Void()
+function bitf_module_set(s::Symbol)
+    global bitf_module = s
+end
+
+function bitf_set_hash(hasher)
+    global bitf_external_hash = hasher
+end
+
+function bitf_set_showerror(fn)
+    global bitf_showerror = fn
+end
+
+function inlineable(@nospecialize(f), @nospecialize(ft), e::Expr, atypes::Vector{Any},
+                    pending_stmt::Vector{Any}, boundscheck::Symbol,
+                    sv::OptimizationState)
+    res = inlineable_int(f, ft,e,atypes, pending_stmt,boundscheck,sv)
+
+    if !isa(bitf_module, Void) && module_name(sv.mod) == bitf_module
+        try
+            push!(bitf_functions, (f,ft,invokelatest(bitf_external_hash, e),atypes))
+        catch e
+            println(e)
+            invokelatest(bitf_showerror, STDERR, e)
+        end
+    end
+
+    return res
+end
+
 # inline functions whose bodies are "inline_worthy"
 # where the function body doesn't contain any argument more than once.
 # static parameters are ok if all the static parameter values are leaf types,
@@ -4394,7 +4482,7 @@ end
 # `ft` is the type of the function. `f` is the exact function if known, or else `nothing`.
 # `pending_stmts` is an array of statements from functions inlined so far, so
 # we can estimate the total size of the enclosing function after inlining.
-function inlineable(@nospecialize(f), @nospecialize(ft), e::Expr, atypes::Vector{Any},
+function inlineable_int(@nospecialize(f), @nospecialize(ft), e::Expr, atypes::Vector{Any},
                     pending_stmt::Vector{Any}, boundscheck::Symbol,
                     sv::OptimizationState)
     argexprs = e.args
@@ -4977,8 +5065,8 @@ function statement_cost(ex::Expr, line::Int, src::CodeInfo, mod::Module, params:
 end
 
 function inline_worthy(body::Array{Any,1}, src::CodeInfo, mod::Module,
-                       params::InferenceParams,
-                       cost_threshold::Integer=params.inline_cost_threshold)
+                           params::InferenceParams,
+                           cost_threshold::Integer=params.inline_cost_threshold)
     bodycost = 0
     for line = 1:length(body)
         stmt = body[line]
@@ -4999,13 +5087,13 @@ function inline_worthy(body::Array{Any,1}, src::CodeInfo, mod::Module,
 end
 
 function inline_worthy(body::Expr, src::CodeInfo, mod::Module, params::InferenceParams,
-                       cost_threshold::Integer=params.inline_cost_threshold)
+                           cost_threshold::Integer=params.inline_cost_threshold)
     bodycost = statement_cost(body, typemax(Int), src, mod, params)
     return bodycost <= cost_threshold
 end
 
 function inline_worthy(@nospecialize(body), src::CodeInfo, mod::Module, params::InferenceParams,
-                       cost_threshold::Integer=params.inline_cost_threshold)
+                           cost_threshold::Integer=params.inline_cost_threshold)
     newbody = exprtype(body, src, mod)
     !isa(newbody, Expr) && return true
     return inline_worthy(newbody, src, mod, params, cost_threshold)
@@ -5202,7 +5290,7 @@ function inlining_pass(e::Expr, sv::OptimizationState, stmts::Vector{Any}, ins, 
                 le -= 1
             elseif i < le
                 ccallargs[rootarg] = nothing
-            end
+             end
             i += 1
         end
     end
@@ -5268,7 +5356,7 @@ function inlining_pass(e::Expr, sv::OptimizationState, stmts::Vector{Any}, ins, 
             (a === Bottom || isvarargtype(a)) && return e
             ata[i] = a
         end
-        res = inlineable(f, ft, e, ata, stmts, boundscheck, sv)
+        res = inlineable(f, ft, e, ata, stmts, boundscheck, sv) 
         if isa(res,Tuple)
             if isa(res[2],Array) && !isempty(res[2])
                 splice!(stmts, ins:ins-1, res[2])
@@ -5960,7 +6048,7 @@ function basic_dce_pass!(sv::OptimizationState)
     end
 end
 
-
+bitf_allocs_removed = 0
 # eliminate allocation of unnecessary objects
 # that are only used as arguments to safe getfield calls
 function alloc_elim_pass!(sv::OptimizationState)
@@ -6000,6 +6088,19 @@ function alloc_elim_pass!(sv::OptimizationState)
                 occurs_outside_getfield(bexpr, var, sv, nv, field_names))
                 i += 1
                 continue
+            end
+
+            if !isa(bitf_module, Void) && module_name(sv.mod) == bitf_module
+                try
+                    push!(bitf_functions, (0,0,invokelatest(bitf_external_hash, e),0))
+                catch e
+                    println(e)
+                    invokelatest(bitf_showerror, STDERR, e)
+                end
+            end
+            
+            if !isa(bitf_module, Void) && module_name(sv.mod) == bitf_module
+                global bitf_allocs_removed += 1
             end
 
             deleteat!(body, i)  # remove tuple allocation
@@ -6109,6 +6210,7 @@ function delete_void_use!(body, var::Slot, i0)
     return ndel
 end
 
+bitf_getfields = 0
 function replace_getfield!(e::Expr, tupname, vals, field_names, sv::OptimizationState)
     for i = 1:length(e.args)
         a = e.args[i]
@@ -6143,6 +6245,19 @@ function replace_getfield!(e::Expr, tupname, vals, field_names, sv::Optimization
                 if a.typ ⊑ typ && !(typ ⊑ a.typ)
                     sv.src.ssavaluetypes[val.id + 1] = a.typ
                 end
+            end
+            
+            if !isa(bitf_module, Void) && module_name(sv.mod) == bitf_module
+                try
+                    push!(bitf_functions, (0,0,invokelatest(bitf_external_hash, a),0))
+                catch e
+                    println(e)
+                    invokelatest(bitf_showerror, STDERR, e)
+                end
+            end
+
+            if !isa(bitf_module, Void) && module_name(sv.mod) == bitf_module
+                global bitf_getfields += 1
             end
             e.args[i] = val
         else
